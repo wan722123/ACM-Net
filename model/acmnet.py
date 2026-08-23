@@ -4,18 +4,18 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as nnf
-from torch.distributions.normal import Normal
 
 
 class TriAxialStripGating(nn.Module):
     """Tri-Axial Strip Gating (TASG) for 3D feature maps.
 
-    The input and output use ``(B, C, D, H, W)`` layout. A local depth-wise
-    convolution is followed by depth-, height-, and width-axis strip
-    convolutions. The sigmoid gate is applied with residual modulation.
+    Paper-aligned implementation for ``(B, C, D, H, W)`` tensors. A local
+    3x3x3 depth-wise convolution is followed by three *parallel* axial strip
+    branches. Their responses are concatenated, projected to a gate, and used
+    for residual modulation as described in Eqs. (1)-(4) of the manuscript.
     """
 
-    def __init__(self, dim, k=11, k_local=5, use_sigmoid=True, residual=True):
+    def __init__(self, dim, k=5, k_local=3, use_sigmoid=True, residual=True):
         super().__init__()
         assert k % 2 == 1 and k_local % 2 == 1, "k and k_local must be odd"
 
@@ -23,17 +23,17 @@ class TriAxialStripGating(nn.Module):
         self.conv_d = nn.Conv3d(dim, dim, kernel_size=(k, 1, 1), padding=(k // 2, 0, 0), groups=dim, bias=False)
         self.conv_h = nn.Conv3d(dim, dim, kernel_size=(1, k, 1), padding=(0, k // 2, 0), groups=dim, bias=False)
         self.conv_w = nn.Conv3d(dim, dim, kernel_size=(1, 1, k), padding=(0, 0, k // 2), groups=dim, bias=False)
-        self.pw = nn.Conv3d(dim, dim, kernel_size=1, bias=True)
+        self.pw = nn.Conv3d(dim * 3, dim, kernel_size=1, bias=True)
 
         self.act = nn.Sigmoid() if use_sigmoid else nn.Identity()
         self.residual = residual
 
     def forward(self, x):
-        attn = self.conv_local(x)
-        attn = self.conv_d(attn)
-        attn = self.conv_h(attn)
-        attn = self.conv_w(attn)
-        attn = self.pw(attn)
+        local = self.conv_local(x)
+        depth_context = self.conv_d(local)
+        height_context = self.conv_h(local)
+        width_context = self.conv_w(local)
+        attn = self.pw(torch.cat([depth_context, height_context, width_context], dim=1))
         attn = self.act(attn)
 
         if self.residual:
@@ -86,20 +86,6 @@ def window_reverse(windows, window_size, dims):
     x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, H, W, T, -1)
     return x
 
-class MLP(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.linear1 = nn.Linear(dim * 2, dim)
-        self.gule1 = nn.GELU()
-        self.linear2 = nn.Linear(dim, dim)
-        self.dim = dim
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.gule1(x)
-        x = self.linear2(x)
-        return x
-
-
 class HeterogeneousAxialMixingAttention(nn.Module):
     """Heterogeneous Axial Mixing Attention (HAMA).
 
@@ -135,6 +121,8 @@ class HeterogeneousAxialMixingAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.split_groups = self.dim // ca_num_heads
+        if expand_ratio != 1:
+            raise ValueError("The paper-aligned HAMA uses expand_ratio=1")
 
         self.v = nn.Linear(dim, dim, bias=qkv_bias)
         self.s = nn.Linear(dim, dim, bias=qkv_bias)
@@ -168,30 +156,23 @@ class HeterogeneousAxialMixingAttention(nn.Module):
             setattr(self, f"local_conv_{i + 1}_2", local_conv_2)
             setattr(self, f"local_conv_{i + 1}_3", local_conv_3)
 
-        self.proj0 = nn.Conv3d(
-            dim,
-            dim * expand_ratio,
-            kernel_size=1,
-            padding=0,
-            stride=1,
-            groups=self.split_groups,
-        )
-
-        self.norm = nn.InstanceNorm3d(dim * expand_ratio, affine=True)
-
-        self.proj1 = nn.Conv3d(dim * expand_ratio, dim, kernel_size=1, padding=0, stride=1)
-        self.dw_conv = nn.Conv3d(dim, dim, kernel_size=3, padding=1, stride=1, groups=dim)
+        # Channel Interaction Structure (CIS): 1x1x1 projection + IN + GELU.
+        self.cis = nn.Conv3d(dim, dim, kernel_size=1, padding=0, stride=1)
+        self.norm = nn.InstanceNorm3d(dim, affine=True)
 
     def forward(self, x, D, H, W):
         B, N, C = x.shape
+        if N != D * H * W:
+            raise ValueError(f"Token count {N} does not match spatial shape {(D, H, W)}")
 
         v = self.v(x)
         s = (
             self.s(x)
-            .reshape(B, H, W, D, self.ca_num_heads, C // self.ca_num_heads)
+            .reshape(B, D, H, W, self.ca_num_heads, C // self.ca_num_heads)
             .permute(4, 0, 5, 1, 2, 3)
         )
 
+        head_outputs = []
         for i in range(self.ca_num_heads):
             local_conv_1 = getattr(self, f"local_conv_{i + 1}_1")
             local_conv_2 = getattr(self, f"local_conv_{i + 1}_2")
@@ -200,17 +181,12 @@ class HeterogeneousAxialMixingAttention(nn.Module):
             s_i = s[i]
             s_i = local_conv_1(s_i)
             s_i = local_conv_2(s_i)
-            s_i = local_conv_3(s_i).reshape(B, self.split_groups, -1, H, W, D)
+            head_outputs.append(local_conv_3(s_i))
 
-            if i == 0:
-                s_out = s_i
-            else:
-                s_out = torch.cat([s_out, s_i], 2)
-
-        s_out = s_out.reshape(B, C, H, W, D)
+        s_out = torch.cat(head_outputs, dim=1)  # (B,C,D,H,W)
 
         s_out = (
-            self.proj1(self.act(self.norm(self.proj0(s_out))))
+            self.act(self.norm(self.cis(s_out)))
             .reshape(B, C, N)
             .permute(0, 2, 1)
         )
@@ -241,17 +217,6 @@ class DConvBlock(nn.Module):
         x_out = self.act2(x)
         return x_out
 
-class DeconvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=2, stride=2):
-        super().__init__()
-        self.deconv = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride)
-        self.norm = nn.InstanceNorm3d(out_channels)
-        self.act = nn.LeakyReLU(0.1)
-    def forward(self, x):
-        x = self.deconv(x)
-        x = self.norm(x)
-        x_out = self.act(x)
-        return x_out
 class HAMAEncoderBlock(nn.Module):
     def __init__(
         self,
@@ -299,7 +264,7 @@ class SharedHierarchicalEncoder(nn.Module):
         channel_num=16,
         use_sc: bool = True,
         sc_ks=(5, 5, 5, 5, 5),
-        sc_k_local: int = 5,
+        sc_k_local: int = 3,
         hama_heads=(2, 2, 4, 4),
         hama_expand_ratio=1,
     ):
@@ -497,16 +462,6 @@ class Sim(nn.Module):
         #out = out.reshape(b, d, h, w, 3).permute(0, 4, 1, 2, 3).contiguous()
         return out
 
-class RegHead(nn.Module):
-    def __init__(self, in_channels, out_channels=3, kernel_size=3, stride=1, padding=1):
-        super().__init__()
-        self.reg_head = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
-        self.reg_head.weight = nn.Parameter(Normal(0, 1e-5).sample(self.reg_head.weight.shape))
-        self.reg_head.bias = nn.Parameter(torch.zeros(self.reg_head.bias.shape))
-    def forward(self, x):
-        x_out = self.reg_head(x)
-        return x_out
-
 def _grad_l2(flow: torch.Tensor) -> torch.Tensor:
     """Simple smoothness: mean squared spatial flow gradient."""
     dz = flow[:, :, 1:, :, :] - flow[:, :, :-1, :, :]
@@ -554,7 +509,6 @@ class AdaptiveCorrelationMatching(Sim):
 
     def forward(self, x_in, y_in):
         b, c, d, h, w = x_in.shape
-        n = d * h * w
 
         x = x_in.permute(0, 2, 3, 4, 1)
         y = y_in.permute(0, 2, 3, 4, 1)
@@ -589,34 +543,45 @@ class AdaptiveCorrelationMatching(Sim):
         x_windows = window_partition(x, window_size)
         y_windows = window_partition(y, window_size)
 
-        affinity = get_aff(x_windows, y_windows)  # (Bwin, winN, C)
-        affinity = affinity.view(-1, *(window_size + (self.channel,)))
-        affinity = window_reverse(affinity, window_size, dims)  # (B, Dp, Hp, Wp, C)
+        # Probability of each moving candidate for every fixed/query location.
+        # Shape: (Bwin, K_query, K_candidate).
+        affinity = get_aff(x_windows, y_windows)
+        candidate_count = affinity.shape[-1]
 
-        if pad_d1 > 0 or pad_r > 0 or pad_b > 0:
-            affinity = affinity[:, :d, :h, :w, :].contiguous()
+        # Candidate displacements are relative offsets (candidate - query),
+        # rather than absolute coordinates inside a window. This implements
+        # M_i = sum_k a_{i,k} v_{i,k} from Eqs. (17)-(19).
+        vectors = [
+            torch.arange(size, device=affinity.device, dtype=affinity.dtype)
+            for size in window_size
+        ]
+        coords = torch.stack(torch.meshgrid(vectors, indexing='ij'), dim=-1).reshape(candidate_count, 3)
+        offsets = coords.unsqueeze(0) - coords.unsqueeze(1)  # (K_query,K_candidate,3)
+        correspondence_windows = torch.einsum('bqk,qkc->bqc', affinity, offsets)
 
-        # (B, N, C)
-        aff = affinity.view(b, n, self.channel)
-
-        # confidence
         if self.conf_type == 'max':
-            conf = aff.max(dim=-1).values  # (B,N)
+            confidence_windows = affinity.max(dim=-1).values
+        elif candidate_count == 1:
+            # The normalized entropy limit for a one-candidate window is 0,
+            # hence its concentration confidence is 1.
+            confidence_windows = affinity.new_ones(affinity.shape[:2])
         else:
             eps = 1e-8
-            p = aff.clamp_min(eps)
+            p = affinity.clamp_min(eps)
             ent = -(p * p.log()).sum(dim=-1)  # (B,N)
-            ent_norm = ent / math.log(self.channel)
-            conf = (1.0 - ent_norm).clamp(0.0, 1.0)
+            ent_norm = ent / math.log(candidate_count)
+            confidence_windows = (1.0 - ent_norm).clamp(0.0, 1.0)
 
-        # expected offset
-        aff_m = aff.reshape(b, n, self.channel, 1).transpose(2, 3)  # (B,N,1,C)
-        v = self.makeV(n).to(aff_m.device)  # (1,N,C,3)
-        out = (aff_m @ v)  # (B,N,1,3)
-        out = out.reshape(b, d, h, w, 3).permute(0, 4, 1, 2, 3)
+        correspondence = window_reverse(correspondence_windows, window_size, dims)
+        confidence = window_reverse(confidence_windows.unsqueeze(-1), window_size, dims)
 
-        conf = conf.reshape(b, 1, d, h, w)
-        return out, conf
+        if pad_d1 > 0 or pad_r > 0 or pad_b > 0:
+            correspondence = correspondence[:, :d, :h, :w, :].contiguous()
+            confidence = confidence[:, :d, :h, :w, :].contiguous()
+
+        correspondence = correspondence.permute(0, 4, 1, 2, 3).contiguous()
+        confidence = confidence.permute(0, 4, 1, 2, 3).contiguous()
+        return correspondence, confidence
 
 
 class ConfidenceGuidedBFFD(nn.Module):
@@ -975,9 +940,14 @@ class ConfidenceGuidedBFFD(nn.Module):
 class ACMNet(nn.Module):
     """Adaptive Correlation Matching Network (ACM-Net).
 
-    The default return value is ``(warped_moving, displacement)`` for backward
-    compatibility with the original training scripts. Set ``return_aux=True``
-    to additionally obtain the multi-scale correspondence and confidence maps.
+    Paper-aligned coarse-to-fine decoder. At every pyramid level, ACM produces
+    the soft residual correspondence ``M_l`` and confidence ``C_l``; BFFD then
+    receives these tensors directly and solves the residual deformation. No
+    additional dense-flow regression or residual-flow bypass is used.
+
+    The default return value is ``(warped_moving, displacement)``. Set
+    ``return_aux=True`` to inspect the multi-scale correspondence, confidence,
+    and BFFD increments.
     """
 
     def __init__(
@@ -1004,43 +974,11 @@ class ACMNet(nn.Module):
             hama_expand_ratio=1,
         )
 
-        self.conv_1 = DConvBlock(in_channel * 1 * 2 + channel_num * 1 + 3, channel_num * 1)
-        self.conv_2 = DConvBlock(in_channel * 2 * 2 + channel_num * 2 + 3, channel_num * 2)
-        self.conv_3 = DConvBlock(in_channel * 4 * 2 + channel_num * 4 + 3, channel_num * 4)
-        self.conv_4 = DConvBlock(in_channel * 8 * 2 + channel_num * 8 + 3, channel_num * 8)
-        self.conv_5 = DConvBlock(in_channel * 16 * 2 + 3, channel_num * 16)
-
         self.corr_1 = AdaptiveCorrelationMatching(in_channel * 1, window_size=matching_window, conf_type=conf_type, plug=BidirectionalFeatureInteraction(in_channel * 1))
         self.corr_2 = AdaptiveCorrelationMatching(in_channel * 2, window_size=matching_window, conf_type=conf_type, plug=BidirectionalFeatureInteraction(in_channel * 2))
         self.corr_3 = AdaptiveCorrelationMatching(in_channel * 4, window_size=matching_window, conf_type=conf_type, plug=BidirectionalFeatureInteraction(in_channel * 4))
         self.corr_4 = AdaptiveCorrelationMatching(in_channel * 8, window_size=matching_window, conf_type=conf_type, plug=BidirectionalFeatureInteraction(in_channel * 8))
         self.corr_5 = AdaptiveCorrelationMatching(in_channel * 16, window_size=matching_window, conf_type=conf_type, plug=BidirectionalFeatureInteraction(in_channel * 16))
-
-        # upsample conv features
-        self.upsample_1 = DeconvBlock(channel_num * 2, channel_num * 1)
-        self.upsample_2 = DeconvBlock(channel_num * 4, channel_num * 2)
-        self.upsample_3 = DeconvBlock(channel_num * 8, channel_num * 4)
-        self.upsample_4 = DeconvBlock(channel_num * 16, channel_num * 8)
-
-        # observation heads (used as solver 'measurements')
-        self.reghead_1 = RegHead(channel_num * 1)
-        self.reghead_2 = RegHead(channel_num * 2)
-        self.reghead_3 = RegHead(channel_num * 4)
-        self.reghead_4 = RegHead(channel_num * 8)
-        self.reghead_5 = RegHead(channel_num * 16)
-
-        # residual heads (dense residual flow); initialized near-zero by default
-        self.reshead_1 = RegHead(channel_num * 1)
-        self.reshead_2 = RegHead(channel_num * 2)
-        self.reshead_3 = RegHead(channel_num * 4)
-        self.reshead_4 = RegHead(channel_num * 8)
-        self.reshead_5 = RegHead(channel_num * 16)
-        self.res_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32), requires_grad=True)
-
-        # start close to pure-solver behavior
-        for m in [self.reshead_1, self.reshead_2, self.reshead_3, self.reshead_4, self.reshead_5]:
-            for p in m.parameters():
-                p.data.mul_(0.0)
 
         # solvers per level (5->1)
         # ctrl_grids order: (L5, L4, L3, L2, L1)
@@ -1071,68 +1009,40 @@ class ACMNet(nn.Module):
 
         # Level 5 (coarsest)
         corr_5, conf_5 = self.corr_5(x_mov_5, x_fix_5)
-        cat = torch.cat([x_mov_5, corr_5, x_fix_5], dim=1)
-        conv_corr_5 = self.conv_5(cat)
-        obs_5 = self.reghead_5(conv_corr_5)
-        flow_solve_5 = self.solver_5(obs_5, conf_5)
-        res_5 = self.reshead_5(conv_corr_5) * self.res_scale
-        flow_5 = flow_solve_5 + res_5
+        flow_solve_5 = self.solver_5(corr_5, conf_5)
+        flow_5 = flow_solve_5
 
         # Level 4
         flow_5_up = self.resize_transformer[3](flow_5)
         x_mov_4 = self.spatial_transformer[3](x_mov_4, flow_5_up)
-        conv_corr_5_up = self.upsample_4(conv_corr_5)
 
         corr_4, conf_4 = self.corr_4(x_mov_4, x_fix_4)
-        cat = torch.cat([x_mov_4, corr_4, x_fix_4, conv_corr_5_up], dim=1)
-        conv_corr_4 = self.conv_4(cat)
-        obs_4 = self.reghead_4(conv_corr_4)
-        flow_solve_4 = self.solver_4(obs_4, conf_4)
-        res_4 = self.reshead_4(conv_corr_4) * self.res_scale
-        delta_4 = flow_solve_4 + res_4
-        flow_4 = delta_4 + flow_5_up
+        flow_solve_4 = self.solver_4(corr_4, conf_4)
+        flow_4 = flow_solve_4 + flow_5_up
 
         # Level 3
         flow_4_up = self.resize_transformer[2](flow_4)
         x_mov_3 = self.spatial_transformer[2](x_mov_3, flow_4_up)
-        conv_corr_4_up = self.upsample_3(conv_corr_4)
 
         corr_3, conf_3 = self.corr_3(x_mov_3, x_fix_3)
-        cat = torch.cat([x_mov_3, corr_3, x_fix_3, conv_corr_4_up], dim=1)
-        conv_corr_3 = self.conv_3(cat)
-        obs_3 = self.reghead_3(conv_corr_3)
-        flow_solve_3 = self.solver_3(obs_3, conf_3)
-        res_3 = self.reshead_3(conv_corr_3) * self.res_scale
-        delta_3 = flow_solve_3 + res_3
-        flow_3 = delta_3 + flow_4_up
+        flow_solve_3 = self.solver_3(corr_3, conf_3)
+        flow_3 = flow_solve_3 + flow_4_up
 
         # Level 2
         flow_3_up = self.resize_transformer[1](flow_3)
         x_mov_2 = self.spatial_transformer[1](x_mov_2, flow_3_up)
-        conv_corr_3_up = self.upsample_2(conv_corr_3)
 
         corr_2, conf_2 = self.corr_2(x_mov_2, x_fix_2)
-        cat = torch.cat([x_mov_2, corr_2, x_fix_2, conv_corr_3_up], dim=1)
-        conv_corr_2 = self.conv_2(cat)
-        obs_2 = self.reghead_2(conv_corr_2)
-        flow_solve_2 = self.solver_2(obs_2, conf_2)
-        res_2 = self.reshead_2(conv_corr_2) * self.res_scale
-        delta_2 = flow_solve_2 + res_2
-        flow_2 = delta_2 + flow_3_up
+        flow_solve_2 = self.solver_2(corr_2, conf_2)
+        flow_2 = flow_solve_2 + flow_3_up
 
         # Level 1 (finest)
         flow_2_up = self.resize_transformer[0](flow_2)
         x_mov_1 = self.spatial_transformer[0](x_mov_1, flow_2_up)
-        conv_corr_2_up = self.upsample_1(conv_corr_2)
 
         corr_1, conf_1 = self.corr_1(x_mov_1, x_fix_1)
-        cat = torch.cat([x_mov_1, corr_1, x_fix_1, conv_corr_2_up], dim=1)
-        conv_corr_1 = self.conv_1(cat)
-        obs_1 = self.reghead_1(conv_corr_1)
-        flow_solve_1 = self.solver_1(obs_1, conf_1)
-        res_1 = self.reshead_1(conv_corr_1) * self.res_scale
-        delta_1 = flow_solve_1 + res_1
-        flow_1 = delta_1 + flow_2_up
+        flow_solve_1 = self.solver_1(corr_1, conf_1)
+        flow_1 = flow_solve_1 + flow_2_up
 
         moved = self.spatial_transformer[0](moving, flow_1)
         if return_aux:
@@ -1140,7 +1050,6 @@ class ACMNet(nn.Module):
                 "soft_correspondence": [corr_1, corr_2, corr_3, corr_4, corr_5],
                 "confidence": [conf_1, conf_2, conf_3, conf_4, conf_5],
                 "bffd_flow": [flow_solve_1, flow_solve_2, flow_solve_3, flow_solve_4, flow_solve_5],
-                "learned_residual": [res_1, res_2, res_3, res_4, res_5],
             }
             return moved, flow_1, aux
         return moved, flow_1
