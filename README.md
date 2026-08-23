@@ -1,45 +1,27 @@
-ACM-Net
+Medical Image Registration Network： ACM-net
 
-Official PyTorch implementation of **Adaptive Correlation Matching Network with Confidence-Guided B-Spline Free-Form Deformation for Unsupervised Deformable Brain MRI Registration**.
+PyTorch implementation of a medical image registration framework.
 
-ACM-Net combines hierarchical feature extraction, adaptive correlation matching, entropy-based confidence estimation, and confidence-guided B-spline free-form deformation for coarse-to-fine medical image registration.
+Installation
 
-## Installation
-
-```bash
 pip install -r requirements.txt
-```
 
-Python 3.10 or later and a CUDA-enabled PyTorch installation are recommended.
+Python 3.10+ and CUDA-enabled PyTorch are recommended.
 
-## Data
+Data
 
-The datasets are not redistributed. Each preprocessed subject should be stored as a `.pkl` file containing an image and its segmentation label. See `data/datasets.py` for the supported formats.
+Datasets are not provided.
+Please prepare the preprocessed data according to the format described
+in data/datasets.py.
 
-## Training
+Training
 
-```bash
-python train.py \
-  --dataset lpba40 \
-  --train-dir datasets/LPBA40/Train \
-  --val-dir datasets/LPBA40/Val \
-  --output-dir runs/lpba40
-```
+python train.py --dataset lpba40 --output-dir runs/lpba40
 
-## Inference
+Inference
 
-```bash
-python infer.py \
-  --dataset lpba40 \
-  --test-dir datasets/LPBA40/Val \
-  --checkpoint runs/lpba40/best.pth.tar
-```
+python infer.py --dataset lpba40 --checkpoint runs/lpba40/best.pth.tar
 
-## Note
+License
 
-This repository follows the architecture described in the manuscript. Checkpoints from earlier development versions may not be compatible with the current implementation.
-
-## License
-
-This project is released under the MIT License.
-
+MIT License.
